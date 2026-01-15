@@ -1367,6 +1367,32 @@ constexpr int KJ_IF_MAYBE_IS_DEPRECATED = 0;
 #define KJ_SILENCE_DANGLING_ELSE_END
 #endif  // __GNUC__
 
+// Tag types for niche optimization customization points (like Stringifier for KJ_STRINGIFY).
+// See NicheOptimizable concept below.
+struct NicheNew {};
+struct NicheIs {};
+struct NicheSet {};
+
+// Wrapper for readMaybe on niche-optimized types (analogous to OwnOwn for Maybe<Own<T>>).
+// See NicheOptimizable concept below.
+template <typename T>
+class NicheWrapper {
+public:
+  inline NicheWrapper(T&& value): value(kj::mv(value)) {}
+
+  inline T& operator*() & { return value; }
+  inline const T& operator*() const & { return value; }
+  inline T&& operator*() && { return kj::mv(value); }
+  inline const T&& operator*() const && { return kj::mv(value); }
+  inline T* operator->() { return &value; }
+  inline const T* operator->() const { return &value; }
+  inline operator T*() { return (NicheIs() * value) ? nullptr : &value; }
+  inline operator const T*() const { return (NicheIs() * value) ? nullptr : &value; }
+
+private:
+  T value;
+};
+
 }  // namespace _ (private)
 
 #define KJ_IF_MAYBE(name, exp) \
@@ -1383,6 +1409,39 @@ static constexpr None none;
 // A "none" value solely for use in comparisons with and initializations of Maybes. `kj::none` will
 // compare equal to all empty Maybes, and will compare not-equal to all non-empty Maybes. If you
 // construct or assign to a Maybe from `kj::none`, the constructed/assigned Maybe will be empty.
+
+// Macros for defining niche optimization customization points.
+// Types can opt into Maybe<T> niche optimization by defining these three friend functions,
+// which allows Maybe<T> to avoid storing a separate bool to track emptiness.
+//
+// Example usage:
+//
+//   class MyType {
+//     // ...
+//   private:
+//     friend void KJ_NICHE_NEW(MyType* ptr) { new (ptr) MyType(/* none state */); }
+//     friend bool KJ_NICHE_IS(const MyType& value) { return /* is none */; }
+//     friend void KJ_NICHE_SET(MyType& value) { /* set to none */; }
+//   };
+//
+#define KJ_NICHE_NEW(...) operator*(::kj::_::NicheNew, __VA_ARGS__)
+#define KJ_NICHE_IS(...) operator*(::kj::_::NicheIs, __VA_ARGS__)
+#define KJ_NICHE_SET(...) operator*(::kj::_::NicheSet, __VA_ARGS__)
+
+// Concept for types that support niche optimization in Maybe<T>.
+// When a type satisfies this concept, Maybe<T> will store T directly without a separate
+// bool flag, using the type's "none" state to represent an empty Maybe.
+//
+// WARNING: kj-rs (the Rust bindings for KJ) has its own knowledge of Maybe<T> memory layout
+// for interoperability with Rust. As of this writing, kj-rs does NOT support NicheOptimizable
+// types. When instantiating Maybe<T> for use with Rust via kj-rs, you MUST static_assert that
+// !NicheOptimizable<T>, or update kj-rs to handle the niche-optimized layout.
+template <typename T>
+concept NicheOptimizable = requires(T* ptr, const T& cref, T& ref) {
+  _::NicheNew() * ptr;
+  _::NicheIs() * cref;
+  _::NicheSet() * ref;
+};
 
 template <typename T>
 inline Maybe<T> some(T&& t) { return Maybe<T>(kj::mv(t)); }
@@ -1665,6 +1724,278 @@ private:
 };
 
 template <typename T>
+  requires NicheOptimizable<T>
+class Maybe<T> {
+  // Partial specialization of Maybe<T> for types that support niche optimization.
+  // Instead of storing a separate bool flag to indicate emptiness, this specialization
+  // uses the type's own "none" state (accessed via the KJ_NICHE_* customization points).
+public:
+  Maybe() { _::NicheNew() * &value; }
+  Maybe(T&& t) { ctor(value, kj::mv(t)); }
+  Maybe(T& t) { ctor(value, t); }
+  Maybe(const T& t) { ctor(value, t); }
+  Maybe(Maybe&& other) {
+    if (_::NicheIs() * other.value) {
+      _::NicheNew() * &value;
+    } else {
+      ctor(value, kj::mv(other.value));
+      _::NicheSet() * other.value;
+    }
+  }
+  Maybe(const Maybe& other) {
+    if (_::NicheIs() * other.value) {
+      _::NicheNew() * &value;
+    } else {
+      ctor(value, other.value);
+    }
+  }
+  Maybe(Maybe& other) {
+    if (_::NicheIs() * other.value) {
+      _::NicheNew() * &value;
+    } else {
+      ctor(value, other.value);
+    }
+  }
+  ~Maybe() { dtor(value); }
+
+  template <typename U>
+  Maybe(Maybe<U>&& other) {
+    KJ_IF_SOME(val, kj::mv(other)) {
+      ctor(value, kj::mv(val));
+      other = kj::none;
+    } else {
+      _::NicheNew() * &value;
+    }
+  }
+  template <typename U>
+  Maybe(const Maybe<U>& other) {
+    KJ_IF_SOME(val, other) {
+      ctor(value, val);
+    } else {
+      _::NicheNew() * &value;
+    }
+  }
+
+  KJ_DEPRECATE_EMPTY_MAYBE_FROM_NULLPTR_ATTR
+  Maybe(decltype(nullptr)) { _::NicheNew() * &value; }
+
+  Maybe(kj::None) { _::NicheNew() * &value; }
+
+  template <typename... Params>
+  inline T& emplace(Params&&... params) {
+    dtor(value);
+    ctor(value, kj::fwd<Params>(params)...);
+    return value;
+  }
+
+  inline Maybe& operator=(T&& other) {
+    dtor(value);
+    ctor(value, kj::mv(other));
+    return *this;
+  }
+  inline Maybe& operator=(T& other) {
+    dtor(value);
+    ctor(value, other);
+    return *this;
+  }
+  inline Maybe& operator=(const T& other) {
+    dtor(value);
+    ctor(value, other);
+    return *this;
+  }
+
+  inline Maybe& operator=(Maybe&& other) {
+    dtor(value);
+    if (_::NicheIs() * other.value) {
+      _::NicheNew() * &value;
+    } else {
+      ctor(value, kj::mv(other.value));
+      _::NicheSet() * other.value;
+    }
+    return *this;
+  }
+  inline Maybe& operator=(Maybe& other) {
+    dtor(value);
+    if (_::NicheIs() * other.value) {
+      _::NicheNew() * &value;
+    } else {
+      ctor(value, other.value);
+    }
+    return *this;
+  }
+  inline Maybe& operator=(const Maybe& other) {
+    dtor(value);
+    if (_::NicheIs() * other.value) {
+      _::NicheNew() * &value;
+    } else {
+      ctor(value, other.value);
+    }
+    return *this;
+  }
+
+  template <typename U>
+  Maybe& operator=(Maybe<U>&& other) {
+    KJ_IF_SOME(val, kj::mv(other)) {
+      dtor(value);
+      ctor(value, kj::mv(val));
+      other = kj::none;
+    } else {
+      _::NicheSet() * value;
+    }
+    return *this;
+  }
+  template <typename U>
+  Maybe& operator=(const Maybe<U>& other) {
+    KJ_IF_SOME(val, other) {
+      dtor(value);
+      ctor(value, val);
+    } else {
+      _::NicheSet() * value;
+    }
+    return *this;
+  }
+
+  KJ_DEPRECATE_EMPTY_MAYBE_FROM_NULLPTR_ATTR
+  inline Maybe& operator=(decltype(nullptr)) { _::NicheSet() * value; return *this; }
+
+  KJ_DEPRECATE_EMPTY_MAYBE_FROM_NULLPTR_ATTR
+  inline bool operator==(decltype(nullptr)) const { return _::NicheIs() * value; }
+
+  inline Maybe& operator=(kj::None) { _::NicheSet() * value; return *this; }
+  inline bool operator==(kj::None) const { return _::NicheIs() * value; }
+
+  inline bool operator==(const Maybe<T>& other) const {
+    if (_::NicheIs() * value) {
+      return other == kj::none;
+    } else {
+      return other != kj::none && value == other.value;
+    }
+  }
+
+  T& orDefault(T& defaultValue) & {
+    if (_::NicheIs() * value) {
+      return defaultValue;
+    } else {
+      return value;
+    }
+  }
+  const T& orDefault(const T& defaultValue) const & {
+    if (_::NicheIs() * value) {
+      return defaultValue;
+    } else {
+      return value;
+    }
+  }
+  T&& orDefault(T&& defaultValue) && {
+    if (_::NicheIs() * value) {
+      return kj::mv(defaultValue);
+    } else {
+      return kj::mv(value);
+    }
+  }
+  const T&& orDefault(const T&& defaultValue) const && {
+    if (_::NicheIs() * value) {
+      return kj::mv(defaultValue);
+    } else {
+      return kj::mv(value);
+    }
+  }
+
+  template <typename F,
+      typename Result = decltype(instance<bool>() ? instance<T&>() : instance<F>()())>
+  Result orDefault(F&& lazyDefaultValue) & {
+    if (_::NicheIs() * value) {
+      return lazyDefaultValue();
+    } else {
+      return value;
+    }
+  }
+
+  template <typename F,
+      typename Result = decltype(instance<bool>() ? instance<const T&>() : instance<F>()())>
+  Result orDefault(F&& lazyDefaultValue) const & {
+    if (_::NicheIs() * value) {
+      return lazyDefaultValue();
+    } else {
+      return value;
+    }
+  }
+
+  template <typename F,
+      typename Result = decltype(instance<bool>() ? instance<T&&>() : instance<F>()())>
+  Result orDefault(F&& lazyDefaultValue) && {
+    if (_::NicheIs() * value) {
+      return lazyDefaultValue();
+    } else {
+      return kj::mv(value);
+    }
+  }
+
+  template <typename F,
+      typename Result = decltype(instance<bool>() ? instance<const T&&>() : instance<F>()())>
+  Result orDefault(F&& lazyDefaultValue) const && {
+    if (_::NicheIs() * value) {
+      return lazyDefaultValue();
+    } else {
+      return kj::mv(value);
+    }
+  }
+
+  template <typename Func>
+  auto map(Func&& f) & -> Maybe<decltype(f(instance<T&>()))> {
+    if (_::NicheIs() * value) {
+      return kj::none;
+    } else {
+      return f(value);
+    }
+  }
+
+  template <typename Func>
+  auto map(Func&& f) const & -> Maybe<decltype(f(instance<const T&>()))> {
+    if (_::NicheIs() * value) {
+      return kj::none;
+    } else {
+      return f(value);
+    }
+  }
+
+  template <typename Func>
+  auto map(Func&& f) && -> Maybe<decltype(f(instance<T&&>()))> {
+    if (_::NicheIs() * value) {
+      return kj::none;
+    } else {
+      return f(kj::mv(value));
+    }
+  }
+
+  template <typename Func>
+  auto map(Func&& f) const && -> Maybe<decltype(f(instance<const T&&>()))> {
+    if (_::NicheIs() * value) {
+      return kj::none;
+    } else {
+      return f(kj::mv(value));
+    }
+  }
+
+private:
+  union {
+    T value;
+  };
+
+  template <typename U>
+  friend class Maybe;
+  template <typename U>
+    requires NicheOptimizable<U>
+  friend _::NicheWrapper<U> _::readMaybe(Maybe<U>&& maybe);
+  template <typename U>
+    requires NicheOptimizable<U>
+  friend U* _::readMaybe(Maybe<U>& maybe);
+  template <typename U>
+    requires NicheOptimizable<U>
+  friend const U* _::readMaybe(const Maybe<U>& maybe);
+};
+
+template <typename T>
 class Maybe<T&> {
 public:
   constexpr Maybe(): ptr(nullptr) {}
@@ -1767,6 +2098,29 @@ private:
   template <typename U>
   friend U* _::readMaybe(const Maybe<U&>& maybe);
 };
+
+namespace _ {  // private
+
+// readMaybe overloads for niche-optimized types.
+template <typename T>
+  requires NicheOptimizable<T>
+NicheWrapper<T> readMaybe(Maybe<T>&& maybe) {
+  return NicheWrapper<T>(kj::mv(maybe.value));
+}
+
+template <typename T>
+  requires NicheOptimizable<T>
+T* readMaybe(Maybe<T>& maybe) {
+  return (NicheIs() * maybe.value) ? nullptr : &maybe.value;
+}
+
+template <typename T>
+  requires NicheOptimizable<T>
+const T* readMaybe(const Maybe<T>& maybe) {
+  return (NicheIs() * maybe.value) ? nullptr : &maybe.value;
+}
+
+}  // namespace _ (private)
 
 // =======================================================================================
 // ArrayPtr

@@ -573,6 +573,131 @@ KJ_TEST("getDestructionReason returns default exception if exception was "
   }
 }
 
+// =======================================================================================
+// Maybe<Exception> niche optimization tests
+
+KJ_TEST("Maybe<Exception> niche optimization size") {
+  // Verify that Maybe<Exception> uses niche optimization (no size overhead).
+  static_assert(sizeof(Maybe<Exception>) == sizeof(Exception),
+      "Maybe<Exception> should have no size overhead due to niche optimization");
+}
+
+KJ_TEST("Maybe<Exception> basic operations") {
+  // Test empty Maybe
+  Maybe<Exception> empty;
+  KJ_EXPECT(empty == kj::none);
+
+  // Test Maybe with value
+  Maybe<Exception> withValue = KJ_EXCEPTION(FAILED, "test error");
+  KJ_EXPECT(withValue != kj::none);
+
+  KJ_IF_SOME(e, withValue) {
+    KJ_EXPECT(e.getDescription() == "test error");
+  } else {
+    KJ_FAIL_EXPECT("Expected exception value");
+  }
+}
+
+KJ_TEST("Maybe<Exception> move semantics") {
+  Maybe<Exception> a = KJ_EXCEPTION(FAILED, "test");
+  KJ_EXPECT(a != kj::none);
+
+  Maybe<Exception> b = kj::mv(a);
+  KJ_EXPECT(a == kj::none);  // moved-from is none
+  KJ_EXPECT(b != kj::none);
+
+  KJ_IF_SOME(e, b) {
+    KJ_EXPECT(e.getDescription() == "test");
+  } else {
+    KJ_FAIL_EXPECT("Expected exception value");
+  }
+}
+
+KJ_TEST("Maybe<Exception> assignment") {
+  Maybe<Exception> maybe;
+  KJ_EXPECT(maybe == kj::none);
+
+  maybe = KJ_EXCEPTION(FAILED, "assigned");
+  KJ_EXPECT(maybe != kj::none);
+
+  maybe = kj::none;
+  KJ_EXPECT(maybe == kj::none);
+}
+
+KJ_TEST("Maybe<Exception> orDefault") {
+  Exception defaultEx = KJ_EXCEPTION(FAILED, "default");
+
+  Maybe<Exception> empty;
+  KJ_EXPECT(&empty.orDefault(defaultEx) == &defaultEx);
+
+  Maybe<Exception> withValue = KJ_EXCEPTION(FAILED, "value");
+  KJ_EXPECT(&withValue.orDefault(defaultEx) != &defaultEx);
+
+  KJ_IF_SOME(e, withValue) {
+    KJ_EXPECT(&withValue.orDefault(defaultEx) == &e);
+  }
+}
+
+KJ_TEST("Maybe<Exception> map") {
+  Maybe<Exception> empty;
+  auto emptyMapped = empty.map([](Exception& e) { return e.getDescription(); });
+  KJ_EXPECT(emptyMapped == kj::none);
+
+  Maybe<Exception> withValue = KJ_EXCEPTION(FAILED, "map test");
+  auto mapped = withValue.map([](Exception& e) { return e.getDescription(); });
+  KJ_IF_SOME(desc, mapped) {
+    KJ_EXPECT(desc == "map test");
+  } else {
+    KJ_FAIL_EXPECT("Expected mapped value");
+  }
+}
+
+KJ_TEST("Maybe<Exception> emplace") {
+  Maybe<Exception> maybe;
+  maybe.emplace(Exception::Type::FAILED, __FILE__, __LINE__, kj::str("emplaced"));
+  KJ_EXPECT(maybe != kj::none);
+
+  KJ_IF_SOME(e, maybe) {
+    KJ_EXPECT(e.getDescription() == "emplaced");
+  } else {
+    KJ_FAIL_EXPECT("Expected emplaced value");
+  }
+}
+
+KJ_TEST("Maybe<Exception> copy semantics") {
+  Maybe<Exception> original = KJ_EXCEPTION(FAILED, "original");
+
+  Maybe<Exception> copy = original;  // copy constructor
+  KJ_EXPECT(original != kj::none);
+  KJ_EXPECT(copy != kj::none);
+
+  KJ_IF_SOME(e, copy) {
+    KJ_EXPECT(e.getDescription() == "original");
+  }
+
+  Maybe<Exception> empty;
+  Maybe<Exception> emptyCopy = empty;
+  KJ_EXPECT(emptyCopy == kj::none);
+}
+
+KJ_TEST("Maybe<Exception> KJ_IF_SOME with rvalue") {
+  auto makeException = []() -> Maybe<Exception> {
+    return KJ_EXCEPTION(FAILED, "from rvalue");
+  };
+
+  KJ_IF_SOME(e, makeException()) {
+    KJ_EXPECT(e.getDescription() == "from rvalue");
+  } else {
+    KJ_FAIL_EXPECT("Expected exception from rvalue");
+  }
+
+  auto makeEmpty = []() -> Maybe<Exception> {
+    return kj::none;
+  };
+
+  KJ_EXPECT(makeEmpty() == kj::none);
+}
+
 }  // namespace
 }  // namespace _ (private)
 }  // namespace kj

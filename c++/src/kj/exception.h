@@ -193,6 +193,24 @@ private:
   // It is very important for sizeof(kj::Exception) to be small, since it is used in result types
   // everywhere. Encapsulate all storage in a heap-allocated object.
 
+  // Private constructor for niche optimization - creates a moved-from Exception.
+  // Uses default construction of storage (which creates a null Own) rather than
+  // the default member initializer which would allocate.
+  explicit Exception(kj::None): storage() {}
+
+  // Niche optimization support for Maybe<Exception>.
+  // These allow Maybe<Exception> to use the moved-from state (storage == nullptr)
+  // as the "none" representation, avoiding the need for a separate bool flag.
+  friend void KJ_NICHE_NEW(Exception* ptr) {
+    new (ptr, kj::_::PlacementNew()) Exception(kj::none);
+  }
+  friend bool KJ_NICHE_IS(const Exception& e) {
+    return e.storage == nullptr;
+  }
+  friend void KJ_NICHE_SET(Exception& e) {
+    e.storage = nullptr;
+  }
+
   friend class ExceptionImpl;
 };
 
